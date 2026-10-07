@@ -29,7 +29,7 @@ Requires **Python 3.8+**. No other packages are needed.
 | Mac | Double-click `Start NetPulse (Mac).command` |
 | Linux / Raspberry Pi | `./start-netpulse.sh` |
 
-The dashboard opens at http://127.0.0.1:8765.
+The dashboard opens at http://127.0.0.1:8790.
 Add `--lan` to open it from other devices on your network. Alert commands and the report folder can only be changed from the computer running NetPulse.
 
 ```

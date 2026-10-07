@@ -10,7 +10,7 @@ NetPulse - hybrid network monitor
                    streaks, last success/failure, TTL, reply IP, MAC address, alert
                    commands, auto-saved reports (HTML/CSV/XML/TXT), command-line reports
 
-Run:   python netpulse.py            -> opens http://127.0.0.1:8765 in your browser
+Run:   python netpulse.py            -> opens http://127.0.0.1:8790 in your browser
        python netpulse.py --lan      -> also reachable from other PCs on your network
        python netpulse.py --load hosts.xlsx --report status.html   (no window)
        python netpulse.py --help     -> every option
@@ -903,6 +903,9 @@ class Handler(BaseHTTPRequestHandler):
         focus = float(q.get("focus", ["600"])[0])
         if u.path in ("/", "/index.html"):
             self._send(PAGE.encode(), "text/html; charset=utf-8")
+        elif u.path == "/np.js":            # lets the My Apps tile find NetPulse's port
+            self._send(b"window.__netpulse=(window.__netpulse||[]).concat([%d]);"
+                       % self.server.server_address[1], "application/javascript")
         elif u.path == "/api/state":
             self._json(api_state(focus, self._is_local()))
         elif u.path == "/api/history":
@@ -1044,7 +1047,7 @@ def main():
                "  netpulse.py --load hosts.csv --report status.html --rounds 3\n"
                "  netpulse.py --interval 5 --timeout 800 --lan",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", type=int, default=8765, help="web page port (default 8765)")
+    ap.add_argument("--port", type=int, default=8790, help="web page port (default 8790)")
     ap.add_argument("--lan", action="store_true", help="allow other computers to open the dashboard")
     ap.add_argument("--no-browser", action="store_true", help="don't open the browser")
     ap.add_argument("--load", metavar="FILE", help="load this .xlsx/.csv/.txt list (replaces the saved list)")
