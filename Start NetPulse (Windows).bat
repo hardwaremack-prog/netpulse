@@ -1,20 +1,66 @@
 @echo off
+rem NetPulse - Windows launcher.
+rem If Python is missing, a box offers to install it, then NetPulse starts.
+setlocal
 title NetPulse
 cd /d "%~dp0"
-set "PY="
-py -3 -c "1" >nul 2>nul && set "PY=py -3"
-if not defined PY python -c "1" >nul 2>nul && set "PY=python"
-if not defined PY for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*") do if exist "%%D\python.exe" set "PY="%%D\python.exe""
-if not defined PY for /d %%D in ("%ProgramFiles%\Python3*") do if exist "%%D\python.exe" set "PY="%%D\python.exe""
-if not defined PY (
-  echo.
-  echo  Python 3 is needed to run NetPulse.
-  echo  Get it free from https://www.python.org/downloads/
-  echo.
-  pause
-  exit /b 1
-)
+set "APP=NetPulse"
+
+call :findpy
+if defined PY goto havepy
+set "BOX_MSG=%APP% needs Python to run.|Python is free and takes a minute or two to install.||Would you like me to install it now and then start %APP%?"
+call :ask
+if errorlevel 1 goto :eof
+call :installpy
+call :findpy
+if not defined PY goto pyfail
+
+:havepy
+
+:run
 %PY% netpulse.py %*
 echo.
-echo  NetPulse has stopped.
+echo  %APP% has stopped.
 pause
+goto :eof
+
+rem ---------------------------------------------------------------
+:findpy
+rem Real Python only - skips the Microsoft Store placeholder that just opens the Store.
+set "PY="
+py -3 -c "1" >nul 2>nul && set "PY=py -3"
+if defined PY exit /b 0
+python -c "1" >nul 2>nul && set "PY=python"
+if defined PY exit /b 0
+for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*") do if exist "%%D\python.exe" set "PY="%%D\python.exe""
+if defined PY exit /b 0
+for /d %%D in ("%ProgramFiles%\Python3*") do if exist "%%D\python.exe" set "PY="%%D\python.exe""
+exit /b 0
+
+:ask
+rem Shows BOX_MSG in a Yes/No box on top of other windows. Sets errorlevel 0 for Yes, 1 for No.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.Form; $f.TopMost = $true; $m = $env:BOX_MSG -replace '\|', [Environment]::NewLine; $r = [System.Windows.Forms.MessageBox]::Show($f, $m, $env:APP, 'YesNo', 'Question'); if ($r -eq 'Yes') { exit 0 } else { exit 1 }"
+exit /b %errorlevel%
+
+:tell
+rem Shows BOX_MSG in an OK box.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.Form; $f.TopMost = $true; $m = $env:BOX_MSG -replace '\|', [Environment]::NewLine; [void][System.Windows.Forms.MessageBox]::Show($f, $m, $env:APP, 'OK', 'Information')"
+exit /b 0
+
+:installpy
+where winget >nul 2>nul
+if errorlevel 1 goto browser
+start "Installing Python for %APP% - this takes a minute or two" /wait winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements
+exit /b 0
+
+:browser
+start "" "https://www.python.org/downloads/"
+set "BOX_MSG=Your browser is opening the Python download page.||Download and run the installer, and tick 'Add python.exe to PATH' on the first screen.||When it's done, open %APP% again."
+call :tell
+exit /b 1
+
+:pyfail
+set "BOX_MSG=Python didn't finish installing, so %APP% can't start yet.||Your browser will open the Python download page. Install it, tick 'Add python.exe to PATH', then open %APP% again."
+call :tell
+start "" "https://www.python.org/downloads/"
+goto :eof
