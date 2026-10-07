@@ -6,9 +6,14 @@ NetPulse - hybrid network monitor
   * Plotter mode : PingPlotter-style latency-over-time graphs, packet-loss markers,
                    hop-by-hop route tracing, multi-target summary graphs
 
+  * PingInfoView-style extras: TCP port pings (host:port), success/fail counts and
+                   streaks, last success/failure, TTL, reply IP, MAC address, alert
+                   commands, auto-saved reports (HTML/CSV/XML/TXT), command-line reports
+
 Run:   python netpulse.py            -> opens http://127.0.0.1:8765 in your browser
        python netpulse.py --lan      -> also reachable from other PCs on your network
-       python netpulse.py --port 9000 --no-browser
+       python netpulse.py --load hosts.xlsx --report status.html   (no window)
+       python netpulse.py --help     -> every option
 
 Needs only Python 3.8+ (no extra packages). Works on Windows, macOS and Linux.
 """
@@ -28,16 +33,34 @@ MAX_SAMPLES = 21600          # per host (6 hours at 1 s, 12 hours at 2 s)
 MAX_HOSTS = 2000
 
 SETTINGS = {"interval": 2.0, "timeout": 1000, "down_after": 2,
-            "warn_ms": 150, "warn_loss": 10, "paused": False}
+            "warn_ms": 150, "warn_loss": 10, "paused": False,
+            "size": 32, "df": False,
+            "cmd_down": "", "cmd_up": "",
+            "autosave_min": 0, "autosave_fmt": "html", "autosave_dir": "", "autosave_stamp": True}
+LOCAL_ONLY = ("cmd_down", "cmd_up", "autosave_dir")   # only changeable from this computer
 LOCK = threading.RLock()
 HOSTS = {}                                   # id -> Host (insertion ordered)
 EVENTS = collections.deque(maxlen=300)
 _next_id = [1]
 POOL = ThreadPoolExecutor(max_workers=128)
 PING_OK = bool(shutil.which("ping"))
+ARP = {}                                     # ip -> MAC
+LAN_MODE = [False]
+AUTOSAVE = {"next": 0, "last": None, "last_file": "", "error": ""}
 
 TIME_RE = re.compile(r"[=<]\s*([\d.,]+)\s*ms", re.I)
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+TTL_RE = re.compile(r"ttl[=:]\s*(\d+)", re.I)
+FROM_RE = re.compile(r"(?:from|de|von)\s+(?:[^\s(]+\s+\()?\[?([0-9a-fA-F.:]+?)\]?\)?[:\s]", re.I)
+PORT_RE = re.compile(r"^(?:\[([0-9a-fA-F:.]+)\]|([^\s:\[\]]+)):(\d{1,5})$")
+
+
+def split_port(addr):
+    """'host:80' or '[::1]:80' -> ('host', 80). Plain hosts and IPv6 -> (addr, None)."""
+    m = PORT_RE.match(addr or "")
+    if m and 0 < int(m.group(3)) < 65536:
+        return (m.group(1) or m.group(2)), int(m.group(3))
+    return addr, None
 
 
 # ----------------------------------------------------------------- ping engine
@@ -51,34 +74,82 @@ def _run(cmd, timeout):
         return -1, ""
 
 
-def ping_cmd(addr, timeout_ms, ttl=None):
+def ping_cmd(addr, timeout_ms, ttl=None, size=None, df=False):
     timeout_ms = int(timeout_ms)
+    v6 = ":" in addr
     if IS_WIN:
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms)] + (["-i", str(ttl)] if ttl else [])
+        if size: cmd += ["-l", str(size)]
+        if df and not v6: cmd += ["-f"]
     elif IS_MAC:
-        if ":" in addr:
-            return ["ping6", "-c", "1", addr]
+        if v6:
+            return ["ping6", "-c", "1"] + (["-s", str(size)] if size else []) + [addr]
         cmd = ["ping", "-c", "1", "-W", str(timeout_ms)] + (["-m", str(ttl)] if ttl else [])
+        if size: cmd += ["-s", str(size)]
+        if df: cmd += ["-D"]
     else:
         cmd = ["ping", "-c", "1", "-W", str(max(1, round(timeout_ms / 1000)))] + \
               (["-t", str(ttl)] if ttl else [])
+        if size: cmd += ["-s", str(size)]
+        if df: cmd += ["-M", "do"]
     return cmd + [addr]
 
 
-def ping_once(addr, timeout_ms):
-    """Return latency in ms, or None if lost."""
-    rc, out = _run(ping_cmd(addr, timeout_ms), timeout_ms / 1000 + 4)
+def ping_once(addr, timeout_ms, size=None, df=False):
+    """Return (ms or None, ttl, reply_ip, status_text)."""
+    rc, out = _run(ping_cmd(addr, timeout_ms, size=size, df=df), timeout_ms / 1000 + 4)
     low = out.lower()
     m = TIME_RE.search(out)
     ok = "ttl=" in low or (rc == 0 and m and "unreachable" not in low and "expired" not in low)
+    reply = None
+    for line in out.splitlines()[1:]:
+        if TIME_RE.search(line) or "unreachable" in line.lower() or "exceeded" in line.lower() \
+                or "expired" in line.lower():
+            fm = FROM_RE.search(line + " ")
+            if fm:
+                reply = fm.group(1).rstrip(":")
+            break
     if not ok:
-        return None
+        if "unreachable" in low:
+            st = "Unreachable"
+        elif "expired" in low or "exceeded" in low:
+            st = "TTL expired"
+        elif "fragment" in low:
+            st = "Needs fragmenting"
+        elif rc == -1 and not out:
+            st = "Ping failed to run"
+        elif "could not find host" in low or "unknown host" in low or "name or service" in low:
+            st = "Unknown host"
+        else:
+            st = "Timed out"
+        return None, None, reply, st
+    tm = TTL_RE.search(out)
+    ms = 0.5
     if m:
         try:
-            return max(0.1, float(m.group(1).replace(",", ".")))
+            ms = max(0.1, float(m.group(1).replace(",", ".")))
         except ValueError:
             pass
-    return 0.5
+    return ms, (int(tm.group(1)) if tm else None), reply, "Succeeded"
+
+
+def tcp_once(host, port, timeout_ms):
+    """TCP 'ping': time to open a connection. Returns (ms or None, None, ip, status)."""
+    t0 = time.perf_counter()
+    try:
+        s = socket.create_connection((host, port), timeout=timeout_ms / 1000.0)
+        ms = (time.perf_counter() - t0) * 1000
+        ip = s.getpeername()[0]
+        s.close()
+        return max(0.05, ms), None, ip, "Port open"
+    except socket.timeout:
+        return None, None, None, "Timed out"
+    except ConnectionRefusedError:
+        return None, None, None, "Port closed"
+    except socket.gaierror:
+        return None, None, None, "Unknown host"
+    except OSError as e:
+        return None, None, None, (e.strerror or "Failed")[:40]
 
 
 def ttl_probe(ip, ttl, timeout_ms=1500):
@@ -94,31 +165,75 @@ def ttl_probe(ip, ttl, timeout_ms=1500):
     return None
 
 
+MAC_RE = re.compile(r"([0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}")
+
+
+def refresh_arp():
+    """Read the computer's ARP table so devices on the local network show a MAC address."""
+    table = {}
+    try:
+        if not IS_WIN and os.path.exists("/proc/net/arp"):
+            with open("/proc/net/arp") as f:
+                for line in f.readlines()[1:]:
+                    p = line.split()
+                    if len(p) >= 4:
+                        table[p[0]] = p[3]
+        else:
+            _, out = _run(["arp", "-a"] if IS_WIN else ["arp", "-an"], 8)
+            for line in out.splitlines():
+                ipm, mm = IPV4_RE.search(line), MAC_RE.search(line)
+                if ipm and mm:
+                    table[ipm.group(0)] = mm.group(0)
+    except Exception:
+        return
+    clean = {}
+    for ip, mac in table.items():
+        parts = re.split(r"[:-]", mac)
+        if len(parts) != 6:
+            continue
+        mac = ":".join(p.zfill(2) for p in parts).upper()
+        if mac in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+            continue
+        clean[ip] = mac
+    ARP.clear(); ARP.update(clean)
+
+
 # ----------------------------------------------------------------- host model
 class Host:
     def __init__(self, addr, name="", group="", parent=None, hop=None):
         self.id = str(_next_id[0]); _next_id[0] += 1
         self.addr, self.name, self.group = addr, name, group
         self.parent, self.hop = parent, hop
+        self.host, self.port = split_port(addr)
         self.ts = array.array("d"); self.ms = array.array("d")
         self.status = "pending" if addr != "*" else "noreply"
         self.since = time.time()
         self.fails = 0
         self.busy = False
-        self.ip = addr if _is_ip(addr) else ""
+        self.ip = self.host if _is_ip(self.host) else ""
         self.trace, self.trace_msg = "idle", ""
+        self.ok_count = self.fail_count = self.max_fails = 0
+        self.last_ok = self.last_fail = self.last_ping = None
+        self.ttl = self.reply = None
+        self.last_status = ""
 
-    def record(self, ms):
+    def record(self, ms, ttl=None, reply=None, st=""):
         now = time.time()
         self.ts.append(now); self.ms.append(-1.0 if ms is None else ms)
         if len(self.ts) > MAX_SAMPLES + 600:
             del self.ts[:600]; del self.ms[:600]
+        self.last_ping, self.last_status = now, st
+        if reply:
+            self.reply = reply
         if ms is None:
-            self.fails += 1
+            self.fails += 1; self.fail_count += 1; self.last_fail = now
+            self.max_fails = max(self.max_fails, self.fails)
             if self.status != "down" and self.fails >= SETTINGS["down_after"]:
                 self.set_status("down", now)
         else:
-            self.fails = 0
+            self.fails = 0; self.ok_count += 1; self.last_ok = now
+            if ttl:
+                self.ttl = ttl
             if self.status != "up":
                 self.set_status("up", now)
 
@@ -140,12 +255,19 @@ class Host:
         ts, ms = self.window(focus)
         n = len(ms)
         vals = [v for v in ms if v >= 0]
+        total = self.ok_count + self.fail_count
         d = {"id": self.id, "addr": self.addr, "name": self.name, "group": self.group,
              "parent": self.parent, "hop": self.hop, "ip": self.ip, "status": self.status,
-             "since": self.since, "trace": self.trace, "trace_msg": self.trace_msg,
-             "sent": n, "recv": len(vals),
+             "port": self.port, "since": self.since, "trace": self.trace,
+             "trace_msg": self.trace_msg, "sent": n, "recv": len(vals),
              "loss": round(100.0 * (n - len(vals)) / n, 1) if n else 0.0,
-             "cur": None, "avg": None, "min": None, "max": None, "jitter": None}
+             "cur": None, "avg": None, "min": None, "max": None, "jitter": None,
+             "ok": self.ok_count, "fail": self.fail_count, "total": total,
+             "fail_pct": round(100.0 * self.fail_count / total, 1) if total else 0.0,
+             "in_row": self.fails, "max_row": self.max_fails,
+             "last_ok": self.last_ok, "last_fail": self.last_fail, "last_ping": self.last_ping,
+             "last_status": self.last_status, "ttl": self.ttl, "reply": self.reply,
+             "mac": ARP.get(self.reply or self.ip or "", "")}
         if len(self.ms) and self.ms[-1] >= 0:
             d["cur"] = round(self.ms[-1], 2)
         if vals:
@@ -167,24 +289,53 @@ class Host:
 def log_event(h, kind, dur):
     EVENTS.appendleft({"t": time.time(), "id": h.id, "name": h.name or h.addr,
                        "addr": h.addr, "kind": kind, "dur": dur})
+    cmd = SETTINGS.get("cmd_down" if kind == "down" else "cmd_up", "")
+    if cmd.strip():
+        threading.Thread(target=run_hook, args=(cmd, h, kind, dur), daemon=True).start()
+
+
+_UNSAFE = re.compile(r"[&|;<>^\"'`$%\\\r\n()!*?{}\[\]]")
+
+
+def run_hook(cmd, h, kind, dur):
+    """Run the user's own command when a device goes down or comes back."""
+    vals = {"name": h.name or h.addr, "addr": h.addr, "ip": h.ip or h.host,
+            "status": kind.upper(), "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "group": h.group, "duration": str(int(dur or 0))}
+    safe = {k: _UNSAFE.sub("", str(v)) for k, v in vals.items()}
+    line = cmd
+    for k, v in safe.items():
+        line = line.replace("{%s}" % k, v)
+    env = dict(os.environ, **{"NETPULSE_" + k.upper(): str(v) for k, v in vals.items()})
+    kw = {"creationflags": 0x08000000} if IS_WIN else {}
+    try:
+        subprocess.Popen(line, shell=True, env=env, cwd=APP_DIR,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    except Exception as e:
+        print("Alert command failed:", e)
 
 
 def probe(h):
     try:
         if not h.ip:
             try:
-                h.ip = socket.gethostbyname(h.addr)
+                h.ip = socket.gethostbyname(h.host)
             except Exception:
                 pass
-        ms = ping_once(h.addr, SETTINGS["timeout"])
+        if h.port:
+            res = tcp_once(h.host, h.port, SETTINGS["timeout"])
+        else:
+            res = ping_once(h.host, SETTINGS["timeout"], SETTINGS.get("size") or None,
+                            SETTINGS.get("df"))
         with LOCK:
             if h.id in HOSTS:
-                h.record(ms)
+                h.record(*res)
     finally:
         h.busy = False
 
 
 def monitor_loop():
+    last_arp = 0
     while True:
         t0 = time.time()
         if not SETTINGS["paused"]:
@@ -194,6 +345,13 @@ def monitor_loop():
                     h.busy = True
             for h in todo:
                 POOL.submit(probe, h)
+        if t0 - last_arp > 30:
+            last_arp = t0
+            POOL.submit(refresh_arp)
+        try:
+            autosave_tick()
+        except Exception as e:
+            AUTOSAVE["error"] = str(e)
         time.sleep(max(0.1, float(SETTINGS["interval"]) - (time.time() - t0)))
 
 
@@ -204,7 +362,7 @@ def run_trace(hid):
         if not h or h.trace == "running":
             return
         h.trace, h.trace_msg = "running", "Resolving..."
-        addr = h.addr
+        addr = h.host
     try:
         ip = socket.gethostbyname(addr)
     except Exception:
@@ -283,6 +441,9 @@ def is_target(s, loose=False):
     s = (s or "").strip()
     if not s:
         return False
+    host, port = split_port(s)
+    if port:
+        return is_target(host, loose)
     if _is_ip(s) or RANGE_RE.match(s):
         return True
     if "/" in s:
@@ -298,6 +459,10 @@ def is_target(s, loose=False):
 
 def expand(s):
     s = s.strip()
+    host, port = split_port(s)
+    if port:
+        hp = ("[%s]" % "%s") if ":" in host else "%s"
+        return [(hp % h) + ":" + str(port) for h in expand(host)]
     m = RANGE_RE.match(s)
     if m:
         a, b = int(m.group(2)), int(m.group(3))
@@ -395,6 +560,7 @@ def parse_text_rows(text):
 ADDR_HDR = ("ip", "ips", "ip address", "ipaddress", "ip addr", "ip_address", "address", "host",
             "hostname", "host name", "host/ip", "ip/host", "device ip", "target", "fqdn", "dns")
 NAME_HDR = ("name", "device", "description", "desc", "label", "hostname alias", "alias", "asset")
+PORT_HDR = ("port", "tcp port", "tcp")
 GROUP_HDR = ("group", "site", "location", "category", "building", "zone", "vlan", "area", "type")
 
 
@@ -409,7 +575,9 @@ def rows_to_entries(rows, default_group, loose=False):
     if hdr is not None:
         for j, c in enumerate(rows[hdr]):
             l = str(c).strip().lower()
-            if "addr" not in cols and (l in ADDR_HDR or l.startswith("ip")):
+            if "port" not in cols and l in PORT_HDR:
+                cols["port"] = j
+            elif "addr" not in cols and (l in ADDR_HDR or l.startswith("ip")):
                 cols["addr"] = j
             elif "name" not in cols and any(k in l for k in NAME_HDR):
                 cols["name"] = j
@@ -448,6 +616,9 @@ def rows_to_entries(rows, default_group, loose=False):
                 if j != ai and c and j != cols.get("group") and not is_target(c):
                     name = c
                     break
+        pt = get("port")
+        if pt.isdigit() and 0 < int(pt) < 65536 and not split_port(addr)[1]:
+            addr = ("[%s]" % addr if ":" in addr else addr) + ":" + pt
         entries.append((addr, name[:80], (get("group") or default_group)[:60]))
     return entries
 
@@ -503,6 +674,8 @@ def import_payload(raw, filename, group, mode):
 
 # ----------------------------------------------------------------- persistence
 def save():
+    if LAN_MODE[1:] and LAN_MODE[1]:        # --report runs never change the saved list
+        return
     with LOCK:
         data = {"settings": {k: v for k, v in SETTINGS.items() if k != "paused"},
                 "hosts": [{"addr": h.addr, "name": h.name, "group": h.group}
@@ -533,11 +706,19 @@ def load():
 
 
 # ----------------------------------------------------------------- API
-def api_state(focus):
+def api_state(focus, local=True):
     with LOCK:
         hosts = [h.snapshot(focus) for h in HOSTS.values()]
+        st = dict(SETTINGS)
+        if not local:                        # don't show commands/folders to other devices
+            for k in LOCAL_ONLY:
+                st[k] = "(set on the host computer)" if st.get(k) else ""
         return {"now": time.time(), "hosts": hosts, "events": list(EVENTS)[:100],
-                "settings": dict(SETTINGS), "platform": SYSTEM, "ping_ok": PING_OK}
+                "settings": st, "platform": SYSTEM, "ping_ok": PING_OK, "local": local,
+                "report_dir": report_dir() if local else "",
+                "autosave": {"next": AUTOSAVE["next"], "last": AUTOSAVE["last"],
+                             "file": os.path.basename(AUTOSAVE["last_file"] or ""),
+                             "error": AUTOSAVE["error"]}}
 
 
 def api_history(ids, focus, buckets):
@@ -578,19 +759,103 @@ def api_history(ids, focus, buckets):
     return {"now": now, "start": start, "bucket": bw, "data": out}
 
 
-def export_csv(focus):
+REPORT_COLS = [("Name", "name"), ("Address", "addr"), ("Resolved IP", "ip"),
+               ("Group", "group"), ("Status", "health"), ("Last result", "last_status"),
+               ("Status since", "since"), ("Now ms", "cur"), ("Avg ms", "avg"),
+               ("Min ms", "min"), ("Max ms", "max"), ("Jitter ms", "jitter"),
+               ("Loss % (window)", "loss"), ("Succeeded", "ok"), ("Failed", "fail"),
+               ("Failed %", "fail_pct"), ("Failed in a row", "in_row"),
+               ("Most failed in a row", "max_row"), ("Total pings", "total"),
+               ("Last succeeded", "last_ok"), ("Last failed", "last_fail"),
+               ("TTL", "ttl"), ("Reply from", "reply"), ("MAC address", "mac")]
+TIME_KEYS = ("since", "last_ok", "last_fail")
+
+
+def report_rows(focus=600):
     st = api_state(focus)
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["Name", "Address", "Resolved IP", "Group", "Status", "Since", "Current ms",
-                "Avg ms", "Min ms", "Max ms", "Jitter ms", "Loss %", "Samples"])
+    rows = []
     for h in st["hosts"]:
         if h["parent"]:
             continue
-        w.writerow([h["name"], h["addr"], h["ip"], h["group"], h["health"].upper(),
-                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h["since"])),
-                    h["cur"], h["avg"], h["min"], h["max"], h["jitter"], h["loss"], h["sent"]])
-    return buf.getvalue().encode("utf-8-sig")
+        r = []
+        for _, k in REPORT_COLS:
+            v = h.get(k)
+            if k in TIME_KEYS:
+                v = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v)) if v else ""
+            elif k == "health":
+                v = (v or "").upper()
+            r.append("" if v is None else v)
+        rows.append(r)
+    return [c for c, _ in REPORT_COLS], rows
+
+
+def build_report(fmt, focus=600):
+    """Return (bytes, content_type, extension) for csv / txt / html / xml."""
+    hdr, rows = report_rows(focus)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    if fmt == "csv":
+        buf = io.StringIO(); w = csv.writer(buf); w.writerow(hdr); w.writerows(rows)
+        return buf.getvalue().encode("utf-8-sig"), "text/csv; charset=utf-8", "csv"
+    if fmt in ("txt", "tab"):
+        lines = ["\t".join(hdr)] + ["\t".join(str(c) for c in r) for r in rows]
+        return ("\r\n".join(lines) + "\r\n").encode("utf-8-sig"), "text/plain; charset=utf-8", "txt"
+    if fmt == "xml":
+        root = ET.Element("netpulse_report", generated=stamp)
+        for r in rows:
+            item = ET.SubElement(root, "item")
+            for (_, k), v in zip(REPORT_COLS, r):
+                ET.SubElement(item, k).text = str(v)
+        return (b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="utf-8")
+                ), "application/xml; charset=utf-8", "xml"
+    import html as _h
+    up = sum(1 for r in rows if r[4] in ("UP", "DEGRADED")); down = sum(1 for r in rows if r[4] == "DOWN")
+    color = {"UP": "#1a9b5a", "DOWN": "#d63546", "DEGRADED": "#c98a00"}
+    body = "".join("<tr>" + "".join(
+        '<td%s>%s</td>' % (' style="color:%s;font-weight:700"' % color.get(c, "#333") if i == 4 else "",
+                           _h.escape(str(c))) for i, c in enumerate(r)) + "</tr>" for r in rows)
+    page = ("<!doctype html><html><head><meta charset='utf-8'><title>NetPulse report %s</title>"
+            "<style>body{font:13px system-ui,sans-serif;margin:20px;color:#222}h1{font-size:20px;margin:0}"
+            "p{color:#666}table{border-collapse:collapse}th,td{border:1px solid #ddd;padding:4px 8px;"
+            "white-space:nowrap}th{background:#f2f5f8;text-align:left}tr:nth-child(even) td{background:#fafbfc}"
+            "</style></head><body><h1>NetPulse report</h1><p>%s &middot; %d devices &middot; %d up &middot; "
+            "%d down</p><table><tr>%s</tr>%s</table></body></html>") % (
+        stamp, stamp, len(rows), up, down, "".join("<th>%s</th>" % c for c in hdr), body)
+    return page.encode("utf-8"), "text/html; charset=utf-8", "html"
+
+
+def report_dir():
+    d = SETTINGS.get("autosave_dir") or os.path.join(APP_DIR, "reports")
+    return os.path.abspath(os.path.expanduser(d))
+
+
+def write_report(fmt, path=None):
+    data, _, ext = build_report(fmt)
+    if not path:
+        d = report_dir(); os.makedirs(d, exist_ok=True)
+        name = "netpulse-report" + (time.strftime("-%Y%m%d-%H%M%S") if SETTINGS.get("autosave_stamp") else "")
+        path = os.path.join(d, name + "." + ext)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
+
+
+def autosave_tick():
+    mins = float(SETTINGS.get("autosave_min") or 0)
+    if mins <= 0:
+        AUTOSAVE["next"] = 0
+        return
+    now = time.time()
+    if not AUTOSAVE["next"]:
+        AUTOSAVE["next"] = now + mins * 60
+    elif now >= AUTOSAVE["next"]:
+        AUTOSAVE["next"] = now + mins * 60
+        try:
+            AUTOSAVE["last_file"] = write_report(SETTINGS.get("autosave_fmt") or "html")
+            AUTOSAVE["last"], AUTOSAVE["error"] = now, ""
+        except Exception as e:
+            AUTOSAVE["error"] = str(e)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -616,27 +881,48 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("File too large")
         return self.rfile.read(n) if n else b""
 
+    # --- safety: only real browsers on this computer (or the LAN, with --lan) may use the API
+    def _host_ok(self):
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            host = host[1:host.find("]")] if "]" in host else host
+        else:
+            host = host.rsplit(":", 1)[0]
+        return LAN_MODE[0] or host == "localhost" or _is_ip(host)   # blocks DNS rebinding
+
+    def _is_local(self):
+        host = (self.headers.get("Host") or "").lower()
+        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and \
+            (host.startswith("127.0.0.1") or host.startswith("localhost") or host.startswith("[::1]"))
+
     def do_GET(self):
+        if not self._host_ok():
+            return self._send(b"forbidden", "text/plain", 403)
         u = urlparse(self.path)
         q = parse_qs(u.query)
         focus = float(q.get("focus", ["600"])[0])
         if u.path in ("/", "/index.html"):
             self._send(PAGE.encode(), "text/html; charset=utf-8")
         elif u.path == "/api/state":
-            self._json(api_state(focus))
+            self._json(api_state(focus, self._is_local()))
         elif u.path == "/api/history":
             ids = [i for i in q.get("ids", [""])[0].split(",") if i]
             self._json(api_history(ids, focus, int(q.get("buckets", ["400"])[0])))
-        elif u.path == "/api/export.csv":
-            self._send(export_csv(focus), "text/csv; charset=utf-8", extra={
-                "Content-Disposition": "attachment; filename=netpulse-%s.csv"
-                                       % time.strftime("%Y%m%d-%H%M")})
+        elif u.path in ("/api/export", "/api/export.csv"):
+            fmt = q.get("fmt", ["csv"])[0]
+            data, ctype, ext = build_report(fmt if fmt in ("csv", "txt", "html", "xml") else "csv", focus)
+            self._send(data, ctype, extra={
+                "Content-Disposition": "attachment; filename=netpulse-%s.%s"
+                                       % (time.strftime("%Y%m%d-%H%M"), ext)})
         else:
             self._send(b"not found", "text/plain", 404)
 
     def do_POST(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        if not self._host_ok() or self.headers.get("X-NetPulse") != "1":
+            return self._json({"error": "Blocked: requests must come from the NetPulse page."}, 403)
+        local = self._is_local()
         try:
             if u.path == "/api/import":
                 raw = self._body()
@@ -663,15 +949,50 @@ class Handler(BaseHTTPRequestHandler):
                         h.name = str(body.get("name", h.name))[:80]
                         h.group = str(body.get("group", h.group))[:60]
                 save()
+            elif u.path == "/api/reset_counts":
+                with LOCK:
+                    for h in HOSTS.values():
+                        h.ok_count = h.fail_count = h.max_fails = 0
+                        h.last_ok = h.last_fail = None
+                        del h.ts[:]; del h.ms[:]
             elif u.path == "/api/settings":
                 for k, cast, lo, hi in (("interval", float, 0.5, 300), ("timeout", int, 200, 10000),
                                         ("down_after", int, 1, 20), ("warn_ms", float, 1, 10000),
-                                        ("warn_loss", float, 0, 100)):
+                                        ("warn_loss", float, 0, 100), ("size", int, 0, 65500),
+                                        ("autosave_min", float, 0, 1440)):
                     if k in body:
                         SETTINGS[k] = min(hi, max(lo, cast(body[k])))
-                if "paused" in body:
-                    SETTINGS["paused"] = bool(body["paused"])
+                for k in ("paused", "df", "autosave_stamp"):
+                    if k in body:
+                        SETTINGS[k] = bool(body[k])
+                if body.get("autosave_fmt") in ("csv", "txt", "html", "xml"):
+                    SETTINGS["autosave_fmt"] = body["autosave_fmt"]
+                if "autosave_min" in body:
+                    AUTOSAVE["next"] = 0
+                blocked = [k for k in LOCAL_ONLY if k in body and str(body[k]) != str(SETTINGS[k])
+                           and not str(body[k]).startswith("(set on")]
+                if blocked and not local:
+                    save()
+                    return self._json({"error": "Alert commands and the report folder can only be "
+                                                "changed on the computer running NetPulse."}, 403)
+                for k in LOCAL_ONLY:
+                    if k in body and local:
+                        SETTINGS[k] = str(body[k]).strip()[:500]
                 save()
+            elif u.path == "/api/save_report":
+                if not local:
+                    return self._json({"error": "Reports can only be saved from the host computer. "
+                                                "Use Export to download one instead."}, 403)
+                path = write_report(body.get("fmt") or SETTINGS.get("autosave_fmt") or "html")
+                return self._json({"ok": True, "path": path})
+            elif u.path == "/api/test_cmd":
+                if not local:
+                    return self._json({"error": "Only on the host computer."}, 403)
+                which = "cmd_up" if body.get("which") == "up" else "cmd_down"
+                if not SETTINGS.get(which):
+                    return self._json({"error": "Type a command first, then Save."}, 400)
+                fake = Host("192.0.2.1", "Test device", "Test")
+                run_hook(SETTINGS[which], fake, "up" if which == "cmd_up" else "down", 0)
             elif u.path == "/api/trace":
                 threading.Thread(target=run_trace, args=(body.get("id"),), daemon=True).start()
             elif u.path == "/api/clear_trace":
@@ -684,17 +1005,77 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 400)
 
 
+def load_file(path, mode="replace"):
+    with open(path, "rb") as f:
+        raw = f.read()
+    return import_payload(raw, os.path.basename(path), "", mode)
+
+
+def headless_report(a):
+    """--report: ping everything a few rounds, write the report, exit (no window)."""
+    rounds = max(1, a.rounds)
+    print("NetPulse: pinging %d devices, %d rounds..." % (
+        sum(1 for h in HOSTS.values() if not h.parent), rounds))
+    refresh_arp()
+    for i in range(rounds):
+        t0 = time.time()
+        todo = [h for h in HOSTS.values() if h.addr != "*"]
+        list(POOL.map(probe, todo))
+        if i < rounds - 1:
+            time.sleep(max(0, float(SETTINGS["interval"]) - (time.time() - t0)))
+    refresh_arp()
+    out = os.path.abspath(a.report)
+    ext = os.path.splitext(out)[1].lower().lstrip(".")
+    fmt = a.format or {"htm": "html", "html": "html", "xml": "xml", "txt": "txt",
+                       "tsv": "txt", "csv": "csv"}.get(ext, "csv")
+    write_report(fmt, out)
+    st = api_state(600)
+    hosts = [h for h in st["hosts"] if not h["parent"]]
+    up = sum(1 for h in hosts if h["status"] == "up")
+    print("Saved %s  (%d up, %d down)" % (out, up, len(hosts) - up))
+    return 0 if up == len(hosts) else 2
+
+
 def main():
-    ap = argparse.ArgumentParser(description="NetPulse network monitor")
-    ap.add_argument("--port", type=int, default=8765)
+    ap = argparse.ArgumentParser(
+        description="NetPulse network monitor",
+        epilog="Examples:\n"
+               "  netpulse.py --load hosts.xlsx\n"
+               "  netpulse.py --load hosts.csv --report status.html --rounds 3\n"
+               "  netpulse.py --interval 5 --timeout 800 --lan",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", type=int, default=8765, help="web page port (default 8765)")
     ap.add_argument("--lan", action="store_true", help="allow other computers to open the dashboard")
-    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--no-browser", action="store_true", help="don't open the browser")
+    ap.add_argument("--load", metavar="FILE", help="load this .xlsx/.csv/.txt list (replaces the saved list)")
+    ap.add_argument("--add", metavar="FILE", help="add this .xlsx/.csv/.txt list to the saved list")
+    ap.add_argument("--report", metavar="FILE",
+                    help="ping, save a report (.csv .txt .html .xml) and exit - no window")
+    ap.add_argument("--rounds", type=int, default=3, help="pings per device for --report (default 3)")
+    ap.add_argument("--format", choices=["csv", "txt", "html", "xml"], help="report format")
+    ap.add_argument("--interval", type=float, help="seconds between pings")
+    ap.add_argument("--timeout", type=int, help="ping timeout in ms")
+    ap.add_argument("--size", type=int, help="ping packet size in bytes")
     a = ap.parse_args()
     if not PING_OK:
         print("  WARNING: the 'ping' command was not found, so every device will show DOWN.")
         print("  On Linux install it with:  sudo apt install iputils-ping\n")
     load()
+    LAN_MODE.append(bool(a.report))
+    for k in ("interval", "timeout", "size"):
+        if getattr(a, k) is not None:
+            SETTINGS[k] = getattr(a, k)
+    try:
+        if a.load:
+            print("Loaded %(added)d devices" % load_file(a.load, "replace"))
+        if a.add:
+            print("Added %(added)d devices" % load_file(a.add, "add"))
+    except Exception as e:
+        sys.exit("Could not read the list: %s" % e)
+    if a.report:
+        sys.exit(headless_report(a))
     threading.Thread(target=monitor_loop, daemon=True).start()
+    LAN_MODE[0] = bool(a.lan)
     bind = "0.0.0.0" if a.lan else "127.0.0.1"
     srv = None
     for port in range(a.port, a.port + 20):
@@ -842,6 +1223,22 @@ button.x{border:0;background:none;color:var(--faint);padding:2px 6px} button.x:h
 .msg{margin-top:10px;font-size:13px} .msg.err{color:var(--down)} .msg.ok{color:var(--up)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .grid2 label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--dim)}
+.menu{position:relative;display:inline-block}
+.menu .pop{display:none;position:absolute;right:0;top:calc(100% + 6px);background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:6px;z-index:15;min-width:210px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.menu.open .pop{display:block}
+.pop button{display:block;width:100%;text-align:left;border:0;background:none;padding:7px 10px;border-radius:6px}
+.pop button:hover{background:var(--line)} .pop hr{border:0;border-top:1px solid var(--line);margin:5px 0}
+.pop label{display:flex;gap:8px;align-items:center;padding:4px 8px;font-size:13px;white-space:nowrap;cursor:pointer}
+.pop .cols{max-height:60vh;overflow:auto}
+button.on2{border-color:var(--acc);color:var(--acc)}
+tr.ghead td{background:var(--panel2);font-weight:600;cursor:pointer;user-select:none;border-bottom:1px solid var(--line2)}
+tr.ghead td .gc{font-weight:400;font-size:12px;margin-left:10px}
+.ok{color:var(--up)}
+.sec{grid-column:1/-1;margin-top:8px;padding-top:12px;border-top:1px solid var(--line);font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:var(--acc)}
+.full{grid-column:1/-1} .grid2 .chk{flex-direction:row;align-items:center;gap:8px;color:var(--text);font-size:13px}
+.hint{font-size:11.5px;color:var(--faint);margin-top:2px}
+.inrow{display:flex;gap:6px} .inrow input{flex:1;min-width:0}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel);border:1px solid var(--acc);border-radius:10px;padding:10px 16px;z-index:40;display:none;max-width:90vw}
 #tip{position:fixed;pointer-events:none;background:#06090d;border:1px solid var(--line2);border-radius:8px;padding:7px 10px;font:12px var(--mono);z-index:30;display:none;white-space:nowrap}
 #offline{display:none;background:var(--down);color:#fff;text-align:center;padding:6px;font-size:13px}
 @media(max-width:1000px){.mwrap,#vPlot{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}.srow,.saxis{grid-template-columns:150px 1fr}}
@@ -874,14 +1271,16 @@ button.x{border:0;background:none;color:var(--faint);padding:2px 6px} button.x:h
         <select id="grp"></select>
         <div class="spacer"></div>
         <span class="dim" id="showing"></span>
-        <button id="btnExport">Export CSV</button>
+        <button id="btnGroups" title="Show devices in collapsible groups">&#9776; Groups</button>
+        <div class="menu" id="mCols"><button id="btnCols">Columns &#9662;</button><div class="pop"><div class="cols" id="colList"></div></div></div>
+        <div class="menu" id="mExport"><button id="btnExport">Export &#9662;</button><div class="pop">
+          <button data-x="csv">Download CSV (Excel)</button><button data-x="html">Download HTML report</button>
+          <button data-x="xml">Download XML</button><button data-x="txt">Download text (tab separated)</button>
+          <hr><button data-x="copy">Copy table to clipboard</button>
+          <button data-x="save" class="localonly">Save report to reports folder now</button></div></div>
         <button id="btnClear">Clear list</button>
       </div>
-      <div style="overflow:auto"><table id="htable"><thead><tr>
-        <th></th><th class="s" data-k="name">Name</th><th class="s" data-k="addr">Address</th><th class="s" data-k="group">Group</th>
-        <th class="s" data-k="status">Status</th><th class="s r" data-k="cur">Now</th><th class="s r" data-k="avg">Avg</th>
-        <th class="s r" data-k="loss">Loss</th><th>Last 60 pings</th><th class="s" data-k="since">For</th><th></th>
-      </tr></thead><tbody></tbody></table></div>
+      <div style="overflow:auto"><table id="htable"><thead></thead><tbody></tbody></table></div>
       <div class="empty" id="empty"><div class="big">&#128225;</div><h2>No devices yet</h2>
         <div>Import an Excel sheet of IPs, or type one in the box at the top.</div><br>
         <button class="pri" onclick="openImport()">Import Excel</button></div>
@@ -899,11 +1298,12 @@ button.x{border:0;background:none;color:var(--faint);padding:2px 6px} button.x:h
   <h2>Import IP list</h2>
   <p>Excel (.xlsx), CSV or text. Columns are found automatically: <b>IP / Host</b>, <b>Name</b>, <b>Group</b>.
   Each sheet in a workbook becomes its own group. Ranges like <span class="mono">10.0.0.1-50</span> and
-  <span class="mono">10.0.0.0/24</span> are expanded.</p>
+  <span class="mono">10.0.0.0/24</span> are expanded. Add <span class="mono">:port</span> (like
+  <span class="mono">192.168.1.10:80</span>) or a <b>Port</b> column to check a service with a TCP ping.</p>
   <div class="drop" id="drop"><b>Drop your file here</b> or click to choose<div id="fname" class="mono" style="margin-top:6px"></div></div>
   <input type="file" id="file" accept=".xlsx,.xlsm,.csv,.txt,.tsv" hidden>
   <div style="margin-top:14px" class="lbl">...or paste IPs (one per line, name after it is optional)</div>
-  <textarea id="paste" placeholder="192.168.1.1  Router&#10;192.168.1.20 Printer&#10;8.8.8.8 Google DNS&#10;10.0.0.1-20"></textarea>
+  <textarea id="paste" placeholder="192.168.1.1  Router&#10;192.168.1.20 Printer&#10;8.8.8.8 Google DNS&#10;192.168.1.50:443 Camera web page&#10;10.0.0.1-20"></textarea>
   <div class="row"><span class="dim">Group (optional)</span><input id="impGroup" placeholder="e.g. Office" style="flex:1"></div>
   <div class="row"><label><input type="radio" name="mode" value="add" checked> Add to current list</label>
     <label><input type="radio" name="mode" value="replace"> Replace current list</label></div>
@@ -911,25 +1311,49 @@ button.x{border:0;background:none;color:var(--faint);padding:2px 6px} button.x:h
   <div class="foot"><button onclick="closeModal('mImport')">Close</button><button class="pri" id="btnDoImport">Import</button></div>
 </div></div>
 
-<div class="modal" id="mSettings"><div class="box">
+<div class="modal" id="mSettings"><div class="box" style="width:640px">
   <h2>Settings</h2><p>Saved next to netpulse.py and used every time it starts.</p>
   <div class="grid2">
+    <div class="sec">Pinging</div>
     <label>Ping every<select id="sInterval"><option value="1">1 second</option><option value="2">2 seconds</option><option value="5">5 seconds</option><option value="10">10 seconds</option><option value="30">30 seconds</option><option value="60">60 seconds</option></select></label>
     <label>Timeout (ms)<input id="sTimeout" type="number" min="200" max="10000" step="100"></label>
-    <label>Mark DOWN after N missed pings<input id="sDownAfter" type="number" min="1" max="20"></label>
+    <label>Packet size (bytes)<input id="sSize" type="number" min="0" max="65500"><span class="hint">32 is normal. Bigger sizes find MTU problems.</span></label>
+    <label class="chk"><input type="checkbox" id="sDF"> Don't fragment</label>
+    <div class="sec">Up / down rules</div>
+    <label>Mark DOWN after N missed pings in a row<input id="sDownAfter" type="number" min="1" max="20"></label>
     <label>Degraded when avg latency over (ms)<input id="sWarn" type="number" min="1"></label>
     <label>Degraded when packet loss over (%)<input id="sLoss" type="number" min="0" max="100"></label>
-    <label>Alert sound when something goes down<select id="sSound"><option value="1">On</option><option value="0">Off</option></select></label>
+    <div></div>
+    <div class="sec">Sounds (this browser)</div>
+    <label class="chk"><input type="checkbox" id="sSound"> Beep when something goes DOWN</label>
+    <label class="chk"><input type="checkbox" id="sSoundUp"> Chime when something comes back UP</label>
+    <div class="sec">Run a command <span class="localnote dim" style="text-transform:none;letter-spacing:0"></span></div>
+    <label class="full">When a device goes DOWN<div class="inrow"><input id="sCmdDown" class="localfld mono" placeholder='e.g. powershell -c "Add-Content alerts.log \"{time} {name} {status}\""'><button type="button" data-test="down" class="localfld">Test</button></div></label>
+    <label class="full">When a device comes back UP<div class="inrow"><input id="sCmdUp" class="localfld mono" placeholder="e.g. a script that texts or emails you"><button type="button" data-test="up" class="localfld">Test</button></div>
+      <span class="hint">Fill-ins: {name} {addr} {ip} {group} {status} {time} {duration}. Also set as NETPULSE_NAME etc. Runs in the NetPulse folder.</span></label>
+    <div class="sec">Auto-save reports</div>
+    <label>Save a report every<select id="sAuto"><option value="0">Off</option><option value="1">1 minute</option><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440">24 hours</option></select></label>
+    <label>Format<select id="sAutoFmt"><option value="html">HTML (opens in a browser)</option><option value="csv">CSV (opens in Excel)</option><option value="xml">XML</option><option value="txt">Text (tab separated)</option></select></label>
+    <label class="full">Folder<input id="sAutoDir" class="localfld mono" placeholder="reports folder next to netpulse.py"><span class="hint" id="autoInfo"></span></label>
+    <label class="chk full"><input type="checkbox" id="sStamp"> Put the date and time in each file name (keeps every report; off = overwrite one file)</label>
+    <div class="sec">Counters</div>
+    <div class="full"><button type="button" id="btnResetCounts">Reset all counts and graphs</button></div>
   </div>
+  <div class="msg" id="setMsg"></div>
   <div class="foot"><button onclick="closeModal('mSettings')">Cancel</button><button class="pri" id="btnSaveSet">Save</button></div>
 </div></div>
-<div id="tip"></div>
+<div id="tip"></div><div id="toast"></div>
 
 <script>
 const FOCUS=[[60,'1m'],[300,'5m'],[600,'10m'],[1800,'30m'],[3600,'1h'],[21600,'6h'],[0,'All']];
 const S={mode:'monitor',hosts:[],events:[],settings:{},focus:600,filter:'all',q:'',group:'',
-  sort:{k:'status',d:1},sel:null,tlId:null,built:'',prev:{},sound:true,file:null,cache:{}};
-try{S.sound=localStorage.getItem('np_sound')!=='0';S.focus=+(localStorage.getItem('np_focus')??600)}catch(e){}
+  sort:{k:'status',d:1},sel:null,tlId:null,built:'',prev:{},sound:true,soundUp:true,file:null,cache:{},
+  local:true,groupView:false,collapsed:{},cols:null};
+try{S.sound=localStorage.getItem('np_sound')!=='0';S.soundUp=localStorage.getItem('np_sound_up')!=='0';S.focus=+(localStorage.getItem('np_focus')??600);
+  S.groupView=localStorage.getItem('np_groups')==='1';S.collapsed=JSON.parse(localStorage.getItem('np_collapsed')||'{}');
+  S.cols=JSON.parse(localStorage.getItem('np_cols')||'null')}catch(e){}
+function store(k,v){try{localStorage.setItem(k,typeof v==='string'?v:JSON.stringify(v))}catch(e){}}
+function toast(t,ms){const el=$('#toast');el.textContent=t;el.style.display='block';clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',ms||3500)}
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtMs=v=>v==null?'—':(v<1?'<1':v<10?v.toFixed(1):Math.round(v))+' ms';
@@ -939,7 +1363,7 @@ function fmtDur(s){s=Math.max(0,Math.round(s));if(s<60)return s+'s';const m=Math
 const clock=t=>new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
 const byId=id=>S.hosts.find(h=>h.id===id);
 const label=h=>h.name||h.addr;
-async function api(p,o){const r=await fetch(p,o);const j=await r.json().catch(()=>({}));if(!r.ok||j.error)throw new Error(j.error||r.statusText);return j}
+async function api(p,o){o=o||{};if(o.method==='POST')o.headers=Object.assign({'X-NetPulse':'1'},o.headers||{});const r=await fetch(p,o);const j=await r.json().catch(()=>({}));if(!r.ok||j.error)throw new Error(j.error||r.statusText);return j}
 const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
 function nice(v){if(!(v>0))return 10;const p=Math.pow(10,Math.floor(Math.log10(v)));for(const m of [1,1.5,2,2.5,3,4,5,6,8,10])if(v<=m*p)return m*p;return 10*p}
 function latColor(v){const w=S.settings.warn_ms||150;return v<w?'#2fd47e':v<w*2?'#f6b73c':'#ff8b3d'}
@@ -958,10 +1382,25 @@ function flash(el){el.style.borderColor='var(--down)';setTimeout(()=>el.style.bo
 $('#btnImport').onclick=()=>openImport();
 $('#btnPause').onclick=async()=>{await post('/api/settings',{paused:!S.settings.paused});tick(true)};
 $('#btnSettings').onclick=()=>{const s=S.settings;$('#sInterval').value=String(+s.interval);$('#sTimeout').value=s.timeout;$('#sDownAfter').value=s.down_after;
-  $('#sWarn').value=s.warn_ms;$('#sLoss').value=s.warn_loss;$('#sSound').value=S.sound?'1':'0';$('#mSettings').classList.add('on')};
-$('#btnSaveSet').onclick=async()=>{S.sound=$('#sSound').value==='1';try{localStorage.setItem('np_sound',S.sound?'1':'0')}catch(e){}
-  await post('/api/settings',{interval:+$('#sInterval').value,timeout:+$('#sTimeout').value,down_after:+$('#sDownAfter').value,warn_ms:+$('#sWarn').value,warn_loss:+$('#sLoss').value});
-  closeModal('mSettings');tick(true)};
+  $('#sWarn').value=s.warn_ms;$('#sLoss').value=s.warn_loss;$('#sSize').value=s.size;$('#sDF').checked=!!s.df;
+  $('#sSound').checked=S.sound;$('#sSoundUp').checked=S.soundUp;$('#sCmdDown').value=s.cmd_down||'';$('#sCmdUp').value=s.cmd_up||'';
+  $('#sAuto').value=String(+s.autosave_min||0);if(!$('#sAuto').value)$('#sAuto').value='0';$('#sAutoFmt').value=s.autosave_fmt||'html';
+  $('#sAutoDir').value=s.autosave_dir||'';$('#sStamp').checked=!!s.autosave_stamp;$('#setMsg').textContent='';
+  $$('.localfld').forEach(el=>el.disabled=!S.local);
+  $('.localnote').textContent=S.local?'':'(only on the computer running NetPulse)';
+  const a=S.autosave||{};$('#autoInfo').textContent=(S.reportDir?'Saving to '+S.reportDir+'. ':'')+(a.error?'Last error: '+a.error:a.last?'Last saved '+clock(a.last)+' ('+a.file+')':'');
+  $('#mSettings').classList.add('on')};
+$('#btnSaveSet').onclick=async()=>{S.sound=$('#sSound').checked;S.soundUp=$('#sSoundUp').checked;store('np_sound',S.sound?'1':'0');store('np_sound_up',S.soundUp?'1':'0');
+  const b={interval:+$('#sInterval').value,timeout:+$('#sTimeout').value,down_after:+$('#sDownAfter').value,warn_ms:+$('#sWarn').value,warn_loss:+$('#sLoss').value,
+    size:+$('#sSize').value,df:$('#sDF').checked,autosave_min:+$('#sAuto').value,autosave_fmt:$('#sAutoFmt').value,autosave_stamp:$('#sStamp').checked};
+  if(S.local){b.cmd_down=$('#sCmdDown').value;b.cmd_up=$('#sCmdUp').value;b.autosave_dir=$('#sAutoDir').value}
+  try{await post('/api/settings',b);closeModal('mSettings');tick(true)}catch(e){$('#setMsg').className='msg err';$('#setMsg').textContent=e.message}};
+$$('[data-test]').forEach(bt=>bt.onclick=async()=>{const m=$('#setMsg');try{
+  await post('/api/settings',{cmd_down:$('#sCmdDown').value,cmd_up:$('#sCmdUp').value});
+  await post('/api/test_cmd',{which:bt.dataset.test});m.className='msg ok';m.textContent='Ran the '+bt.dataset.test.toUpperCase()+' command for a pretend "Test device".'}
+  catch(e){m.className='msg err';m.textContent=e.message}});
+$('#btnResetCounts').onclick=async()=>{if(!confirm('Reset every count, graph and failure streak? Your device list stays.'))return;
+  await post('/api/reset_counts');closeModal('mSettings');tick(true)};
 function closeModal(id){$('#'+id).classList.remove('on')}
 $$('.modal').forEach(m=>m.onclick=e=>{if(e.target===m)m.classList.remove('on')});
 document.onkeydown=e=>{if(e.key==='Escape')$$('.modal').forEach(m=>m.classList.remove('on'))};
@@ -995,10 +1434,55 @@ $('#htable thead').onclick=e=>{const th=e.target.closest('th.s');if(!th)return;c
   S.sort=S.sort.k===k?{k,d:-S.sort.d}:{k,d:1};render()};
 $('#htable tbody').onclick=async e=>{const del=e.target.closest('[data-del]');
   if(del){e.stopPropagation();await post('/api/remove',{ids:[del.dataset.del]});tick(true);return}
+  const gh=e.target.closest('tr.ghead');if(gh){const g=gh.dataset.g;S.collapsed[g]=!S.collapsed[g];store('np_collapsed',S.collapsed);render();return}
   const tr=e.target.closest('tr[data-id]');if(tr){S.sel=tr.dataset.id;S.tlId=null;setMode('plot')}};
 $('#events').onclick=e=>{const li=e.target.closest('li[data-id]');if(li&&byId(li.dataset.id)){S.sel=li.dataset.id;S.tlId=null;setMode('plot')}};
-$('#btnExport').onclick=()=>location.href='/api/export.csv?focus='+S.focus;
 $('#btnClear').onclick=async()=>{if(confirm('Remove every device from the list?')){await post('/api/clear');tick(true)}};
+$('#btnGroups').onclick=()=>{S.groupView=!S.groupView;store('np_groups',S.groupView?'1':'0');render()};
+$$('.menu > button').forEach(b=>b.onclick=e=>{e.stopPropagation();const m=b.parentNode,o=!m.classList.contains('open');$$('.menu').forEach(x=>x.classList.remove('open'));m.classList.toggle('open',o)});
+document.addEventListener('click',e=>{if(!e.target.closest('.menu'))$$('.menu').forEach(x=>x.classList.remove('open'))});
+$('#mExport .pop').onclick=async e=>{const b=e.target.closest('[data-x]');if(!b)return;const x=b.dataset.x;$('#mExport').classList.remove('open');
+  if(x==='copy'){const t=await fetch('/api/export?fmt=txt&focus='+S.focus).then(r=>r.text());copyText(t.replace(/^﻿/,''))}
+  else if(x==='save'){try{const r=await post('/api/save_report',{});toast('Saved '+r.path,6000)}catch(err){toast(err.message,6000)}}
+  else location.href='/api/export?fmt='+x+'&focus='+S.focus};
+async function copyText(t){try{await navigator.clipboard.writeText(t);toast('Copied the table. Paste it into Excel or an email.')}
+  catch(e){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();
+    let ok=false;try{ok=document.execCommand('copy')}catch(_){}ta.remove();toast(ok?'Copied the table. Paste it into Excel or an email.':'Your browser blocked copying. Use Download instead.')}}
+const T=t=>t?new Date(t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';
+const COLS=[
+ {k:'dot',l:'',fixed:1,cell:h=>`<span class="dot ${h.health}"></span>`},
+ {k:'name',l:'Name',on:1,sort:h=>label(h).toLowerCase(),cls:'nm',cell:h=>esc(label(h))},
+ {k:'addr',l:'Address',on:1,sort:h=>ipKey(h.addr),cls:'mono',cell:h=>esc(h.addr)+(h.port?' <span class="badge pending">TCP</span>':'')+(h.ip&&h.ip!==h.addr&&h.ip!==h.addr.split(':')[0]?`<small>${esc(h.ip)}</small>`:'')},
+ {k:'group',l:'Group',on:1,sort:h=>h.group.toLowerCase(),cls:'dim',cell:h=>esc(h.group)},
+ {k:'status',l:'Status',on:1,sort:h=>RANK[h.health],cell:h=>`<span class="badge ${h.health}">${h.health.toUpperCase()}</span>`},
+ {k:'last_status',l:'Last result',sort:h=>h.last_status,cls:'dim',cell:h=>esc(h.last_status||'—')},
+ {k:'cur',l:'Now',on:1,r:1,cls:'mono',cell:h=>fmtMs(h.cur)},
+ {k:'avg',l:'Avg',on:1,r:1,cls:'mono',cell:h=>fmtMs(h.avg)},
+ {k:'min',l:'Min',r:1,cls:'mono',cell:h=>fmtMs(h.min)},
+ {k:'max',l:'Max',r:1,cls:'mono',cell:h=>fmtMs(h.max)},
+ {k:'jitter',l:'Jitter',r:1,cls:'mono',cell:h=>fmtMs(h.jitter)},
+ {k:'loss',l:'Loss',on:1,r:1,cls:'mono',tip:'Packet loss in the selected time window',cell:h=>`<span class="${h.loss>0?'bad':'dim'}">${h.sent?h.loss+'%':'—'}</span>`},
+ {k:'ok',l:'Succeeded',r:1,cls:'mono',cell:h=>`<span class="ok">${h.ok}</span>`},
+ {k:'fail',l:'Failed',r:1,cls:'mono',cell:h=>`<span class="${h.fail?'bad':'dim'}">${h.fail}</span>`},
+ {k:'fail_pct',l:'Failed %',r:1,cls:'mono',tip:'Failed pings since NetPulse started (or since reset)',cell:h=>h.total?h.fail_pct+'%':'—'},
+ {k:'in_row',l:'Fails in a row',on:1,r:1,cls:'mono',cell:h=>`<span class="${h.in_row?'bad':'dim'}">${h.in_row}</span>`},
+ {k:'max_row',l:'Most in a row',r:1,cls:'mono',tip:'Longest run of failed pings',cell:h=>`<span class="${h.max_row?'bad':'dim'}">${h.max_row}</span>`},
+ {k:'total',l:'Total pings',r:1,cls:'mono',cell:h=>h.total},
+ {k:'last_ok',l:'Last succeeded',sort:h=>h.last_ok||0,cls:'dim',cell:h=>T(h.last_ok)},
+ {k:'last_fail',l:'Last failed',sort:h=>h.last_fail||0,cls:'dim',cell:h=>T(h.last_fail)},
+ {k:'ttl',l:'TTL',r:1,cls:'mono',cell:h=>h.ttl??'—'},
+ {k:'reply',l:'Reply from',sort:h=>ipKey(h.reply||''),cls:'mono',cell:h=>esc(h.reply||'—')},
+ {k:'mac',l:'MAC address',sort:h=>h.mac||'~',cls:'mono',tip:'Only for devices on your own network',cell:h=>esc(h.mac||'—')},
+ {k:'spark',l:'Last 60 pings',on:1,nosort:1,cell:h=>`<canvas class="spark" data-id="${h.id}"></canvas>`},
+ {k:'since',l:'For',on:1,sort:h=>h.since,cls:'dim',cell:h=>stateText(h)},
+ {k:'del',l:'',fixed:1,cell:h=>`<button class="x" data-del="${h.id}" title="Remove">&#10005;</button>`}];
+if(!S.cols)S.cols=COLS.filter(c=>c.on).map(c=>c.k);
+function visCols(){return COLS.filter(c=>c.fixed||S.cols.includes(c.k))}
+function buildColList(){$('#colList').innerHTML=COLS.filter(c=>!c.fixed).map(c=>`<label><input type="checkbox" data-c="${c.k}" ${S.cols.includes(c.k)?'checked':''}> ${c.l}</label>`).join('')+
+  '<hr><button data-reset="1">Back to the default columns</button>'}
+buildColList();
+$('#colList').onclick=e=>{e.stopPropagation();if(e.target.dataset.reset){S.cols=COLS.filter(c=>c.on).map(c=>c.k);buildColList()}
+  else{const c=e.target.dataset.c;if(!c)return;S.cols=e.target.checked?[...S.cols,c]:S.cols.filter(x=>x!==c)}store('np_cols',S.cols);S.headKey='';render()};
 const RANK={down:0,degraded:1,pending:2,up:3,noreply:4};
 function stateText(h){const d=fmtDur(Date.now()/1000-h.since);return h.status==='pending'?'waiting...':(h.status==='down'?'down ':'up ')+d}
 
@@ -1008,19 +1492,20 @@ function renderMonitor(mon){
   if(gsel.dataset.k!==want){gsel.dataset.k=want;gsel.innerHTML='<option value="">All groups</option>'+groups.map(g=>`<option>${esc(g)}</option>`).join('');gsel.value=S.group}
   gsel.style.display=groups.length?'':'none';
   let list=mon.filter(h=>(S.filter==='all'||h.health===S.filter)&&(!S.group||h.group===S.group)&&
-    (!S.q||(h.name+' '+h.addr+' '+h.ip+' '+h.group).toLowerCase().includes(S.q)));
-  const {k,d}=S.sort;
-  const val=h=>k==='status'?RANK[h.health]:k==='name'?label(h).toLowerCase():k==='addr'?ipKey(h.addr):k==='group'?h.group.toLowerCase():k==='since'?h.since:(h[k]??1e9);
+    (!S.q||(h.name+' '+h.addr+' '+h.ip+' '+h.group+' '+(h.mac||'')).toLowerCase().includes(S.q)));
+  const {k,d}=S.sort;const col=COLS.find(c=>c.k===k);
+  const val=col&&col.sort?col.sort:(h=>h[k]??-1);
   list.sort((a,b)=>{const x=val(a),y=val(b);return (x<y?-1:x>y?1:ipKey(a.addr)<ipKey(b.addr)?-1:1)*d});
-  $$('#htable th.s').forEach(th=>{th.querySelector('.ar')?.remove();if(th.dataset.k===k)th.insertAdjacentHTML('beforeend',`<span class="ar"> ${d>0?'▲':'▼'}</span>`)});
-  $('#htable tbody').innerHTML=list.map(h=>`<tr data-id="${h.id}" class="h-${h.health}">
-    <td><span class="dot ${h.health}"></span></td><td class="nm">${esc(label(h))}</td>
-    <td class="mono">${esc(h.addr)}${h.ip&&h.ip!==h.addr?`<small>${esc(h.ip)}</small>`:''}</td>
-    <td class="dim">${esc(h.group)}</td><td><span class="badge ${h.health}">${h.health.toUpperCase()}</span></td>
-    <td class="mono r">${fmtMs(h.cur)}</td><td class="mono r">${fmtMs(h.avg)}</td>
-    <td class="mono r ${h.loss>0?'bad':'dim'}">${h.sent?h.loss+'%':'—'}</td>
-    <td><canvas class="spark" data-id="${h.id}"></canvas></td><td class="dim">${stateText(h)}</td>
-    <td><button class="x" data-del="${h.id}" title="Remove">&#10005;</button></td></tr>`).join('');
+  const vc=visCols(),hk=vc.map(c=>c.k).join()+k+d;
+  if(S.headKey!==hk){S.headKey=hk;$('#htable thead').innerHTML='<tr>'+vc.map(c=>`<th class="${c.fixed||c.nosort?'':'s'} ${c.r?'r':''}" data-k="${c.k}" ${c.tip?`title="${c.tip}"`:''}>${c.l}${c.k===k?`<span class="ar"> ${d>0?'▲':'▼'}</span>`:''}</th>`).join('')+'</tr>'}
+  const row=h=>`<tr data-id="${h.id}" class="h-${h.health}">`+vc.map(c=>`<td class="${c.cls||''} ${c.r?'r':''}">${c.cell(h)}</td>`).join('')+'</tr>';
+  const grouped=S.groupView&&groups.length;$('#btnGroups').classList.toggle('on2',!!grouped);$('#btnGroups').style.display=groups.length?'':'none';
+  let html;
+  if(grouped){const by={};list.forEach(h=>(by[h.group||'']??=[]).push(h));
+    html=Object.keys(by).sort((a,b)=>(a===''?'~':a).localeCompare(b===''?'~':b)).map(g=>{const hs=by[g],c={up:0,down:0,degraded:0};hs.forEach(h=>c[h.health]=(c[h.health]||0)+1);const cl=S.collapsed[g];
+      return `<tr class="ghead" data-g="${esc(g)}"><td colspan="${vc.length}">${cl?'&#9656;':'&#9662;'} ${esc(g||'Ungrouped')} <span class="dim gc">${hs.length} device${hs.length>1?'s':''}</span><span class="gc ok">${c.up+c.degraded} up</span>${c.down?`<span class="gc bad">${c.down} down</span>`:''}</td></tr>`+(cl?'':hs.map(row).join(''))}).join('')}
+  else html=list.map(row).join('');
+  $('#htable tbody').innerHTML=html;
   $$('canvas.spark').forEach(cv=>{const h=byId(cv.dataset.id);if(h)drawSpark(cv,h.spark)});
   $('#empty').style.display=mon.length?'none':'';
   $('#showing').textContent=mon.length?(list.length===mon.length?`${mon.length} devices`:`showing ${list.length} of ${mon.length}`):'';
@@ -1182,15 +1667,19 @@ function render(){
   $('#pulse').classList.toggle('off',!!S.settings.paused);
   S.mode==='monitor'?renderMonitor(mon):renderPlot(mon);
 }
-function checkAlerts(){let newDown=0;
-  S.hosts.forEach(h=>{if(h.parent)return;const p=S.prev[h.id];if(h.status==='down'&&p&&p!=='down')newDown++;S.prev[h.id]=h.status});
-  if(newDown&&S.sound)beep()}
+function checkAlerts(){let newDown=0,newUp=0;
+  S.hosts.forEach(h=>{if(h.parent)return;const p=S.prev[h.id];if(h.status==='down'&&p&&p!=='down')newDown++;if(h.status==='up'&&p==='down')newUp++;S.prev[h.id]=h.status});
+  if(newDown&&S.sound)beep();else if(newUp&&S.soundUp)chime()}
+function chime(){try{const a=new (window.AudioContext||window.webkitAudioContext)();[0,.12,.24].forEach((d,i)=>{const o=a.createOscillator(),g=a.createGain();
+  o.frequency.value=[523,659,784][i];o.type='sine';g.gain.setValueAtTime(.08,a.currentTime+d);g.gain.exponentialRampToValueAtTime(.0001,a.currentTime+d+.35);
+  o.connect(g).connect(a.destination);o.start(a.currentTime+d);o.stop(a.currentTime+d+.36)})}catch(e){}}
 function beep(){try{const a=new (window.AudioContext||window.webkitAudioContext)();[0,.22].forEach(d=>{const o=a.createOscillator(),g=a.createGain();
   o.frequency.value=d?520:880;o.type='square';g.gain.setValueAtTime(.06,a.currentTime+d);g.gain.exponentialRampToValueAtTime(.0001,a.currentTime+d+.2);
   o.connect(g).connect(a.destination);o.start(a.currentTime+d);o.stop(a.currentTime+d+.2)})}catch(e){}}
 let timer=null,busy=false;
 async function tick(now){clearTimeout(timer);if(busy&&!now){timer=setTimeout(tick,1500);return}busy=true;
-  try{const d=await api('/api/state?focus='+S.focus);S.hosts=d.hosts;S.events=d.events;S.settings=d.settings;
+  try{const d=await api('/api/state?focus='+S.focus);S.hosts=d.hosts;S.events=d.events;S.settings=d.settings;S.local=d.local;S.autosave=d.autosave;S.reportDir=d.report_dir;
+    $$('.localonly').forEach(el=>el.style.display=d.local?'':'none');
     $('#offline').style.display='none';$('#noping').style.display=d.ping_ok?'none':'block';checkAlerts();render();await drawPlot()}
   catch(e){$('#offline').style.display='block'}
   finally{busy=false;timer=setTimeout(tick,1500)}}
